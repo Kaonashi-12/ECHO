@@ -1,0 +1,102 @@
+seed: 2026
+
+experiment:
+  output_dir: outputs/eval_generation_claim1_clean/qwen05b_v100_independent_reasoning
+
+model:
+  name: Qwen/Qwen2.5-0.5B
+  max_length: 1024
+  dtype: fp32
+  trust_remote_code: false
+  padding_side: left
+  attn_implementation: eager
+  gradient_checkpointing: false
+
+lora:
+  target_modules:
+    - q_proj
+    - v_proj
+    - o_proj
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+
+generation:
+  batch_size: 4
+  max_input_length: 1024
+  max_new_tokens: 512
+  do_sample: false
+  temperature: 1.0
+  top_p: 1.0
+  padding_side: left
+  prediction_max_chars: 8192
+
+checkpoints:
+  - name: base_qwen
+    type: base
+    path: null
+  - name: stage1_echo_clean_ckpt500
+    path: outputs/claim1_stage1_echo_reasoning_raw_qwen05b_v100/checkpoint_step_500.pt
+    strict_lora: true
+  - name: stage2_echo_clean_final
+    path: outputs/claim1_stage2_echo_math_from_stage1_echo_clean_qwen05b_v100/checkpoint_final.pt
+    strict_lora: true
+  - name: stage1_sft_reasoning_matched_ckpt500
+    path: outputs/claim1_stage1_sft_reasoning_matched_qwen05b_v100/checkpoint_step_500.pt
+    strict_lora: true
+  - name: stage2_full_sft_matched_final
+    path: outputs/claim1_stage2_full_sft_from_stage1_sft_reasoning_qwen05b_v100/checkpoint_final.pt
+    strict_lora: true
+
+datasets:
+  - name: olympiadbench_oe_to_maths_en_comp
+    path: Hothan/OlympiadBench
+    config: OE_TO_maths_en_COMP
+    split: train
+    kind: olympiad_math
+    prompt_template: "Problem: {question}\nAnswer:"
+    answer_template: "The answer is {final_answer}"
+    source_id_field: id
+    filters:
+      - field: subject
+        op: eq
+        value: Math
+      - field: language
+        op: eq
+        value: English
+      - field: modality
+        op: eq
+        value: Text-only
+      - field: question_type
+        op: eq
+        value: Open-ended
+      - field: is_multiple_answer
+        op: eq
+        value: false
+      - field: final_answer
+        op: not_empty
+    metadata_keys:
+      - subject
+      - language
+      - modality
+      - question_type
+      - subfield
+      - difficulty
+      - answer_type
+      - unit
+  - name: omni_math_test
+    path: KbsdJames/Omni-MATH
+    config: default
+    split: test
+    kind: omni_math
+    prompt_template: "Problem: {problem}\nAnswer:"
+    answer_template: "The answer is {answer}"
+    filters:
+      - field: answer
+        op: not_empty
+      - field: solution
+        op: not_empty
+    metadata_keys:
+      - domain
+      - difficulty
+      - source

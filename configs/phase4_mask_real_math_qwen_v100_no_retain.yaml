@@ -1,0 +1,109 @@
+seed: 2026
+
+experiment:
+  output_dir: outputs/phase4_mask_real_math_qwen05b_v100_no_retain_fp32_bs16x4
+
+data:
+  mode: real_math_cross
+  domains:
+    - name: gsm8k
+      path: openai/gsm8k
+      config: main
+      split: train
+      kind: gsm8k
+    - name: svamp
+      path: ChilleD/SVAMP
+      split: train
+      kind: svamp
+    - name: asdiv
+      path: EleutherAI/asdiv
+      split: validation
+      kind: asdiv
+    - name: mawps
+      path: garrethlee/MAWPS
+      split: train
+      kind: mawps
+    - name: multiarith
+      path: ChilleD/MultiArith
+      split: train
+      kind: multiarith
+  retain_domains: []
+
+model:
+  name: Qwen/Qwen2.5-0.5B
+  max_length: 256
+  dtype: fp32
+  trust_remote_code: false
+  padding_side: right
+  attn_implementation: eager
+  gradient_checkpointing: true
+  gradient_checkpointing_use_reentrant: false
+
+lora:
+  target_modules:
+    - q_proj
+    - v_proj
+    - o_proj
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+
+mask_head:
+  hidden_proj: 192
+  mlp_hidden: 384
+  temperature: 1.0
+
+inner:
+  lr: 0.01
+
+outer:
+  retain_kl_weight: 0.0
+  mask_cost_weight: 0.0005
+  mask_budget_target: 0.55
+  mask_budget_weight: 0.2
+  mask_budget_mode: upper
+  lora_meta_grad_weight: 0.25
+
+optim:
+  mask_lr: 0.0001
+  lora_lr: 0.0001
+  mask_weight_decay: 0.01
+  lora_weight_decay: 0.0
+  max_grad_norm: 1.0
+  max_lora_grad_norm: 1.0
+
+training:
+  mode: online_mask_to_lora
+  steps: 3000
+  support_batch_size: 16
+  target_batch_size: 16
+  retain_batch_size: 0
+  mask_loss_normalization: budget_floor
+  mask_loss_budget_floor: 0.35
+  support_micro_batch_size: 4
+  target_micro_batch_size: 4
+  retain_micro_batch_size: 1
+  log_every: 1
+  baseline_every: 100
+  save_every: 500
+
+mask_trace:
+  enabled: true
+  filename: mask_trace_rank{rank}.jsonl.gz
+  every_n_steps: 50
+  threshold: 0.5
+  top_k: 32
+  include_text: true
+  include_token_ids: true
+  include_token_loss: true
+  include_all_values: false
+  round_digits: 6
+  flush_every_n_steps: 50
+  compresslevel: 3
+
+wandb:
+  enabled: true
+  project: intent-update-mask-formal
+  name: phase4-real-math-qwen05b-v100-no-retain-fp32-bs16x4
+  mode: online
+  allow_fallback_offline: true

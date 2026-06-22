@@ -1,0 +1,73 @@
+seed: 2026
+
+experiment:
+  output_dir: outputs/claim1_stage1_sft_reasoning_matched_qwen05b_v100
+
+data:
+  mode: real_math_mix
+  sampling: uniform_domain
+  domains:
+    - name: gsm8k
+      path: openai/gsm8k
+      config: main
+      split: train
+      kind: gsm8k
+      completion_mode: full_solution
+    - name: svamp
+      path: ChilleD/SVAMP
+      split: train
+      kind: svamp
+      completion_mode: full_solution
+    - name: asdiv
+      path: EleutherAI/asdiv
+      split: validation
+      kind: asdiv
+      completion_mode: full_solution
+    - name: mawps
+      path: garrethlee/MAWPS
+      split: train
+      kind: mawps
+      completion_mode: full_solution
+    - name: multiarith
+      path: ChilleD/MultiArith
+      split: train
+      kind: multiarith
+      completion_mode: full_solution
+
+model:
+  name: Qwen/Qwen2.5-0.5B
+  max_length: 512
+  dtype: fp32
+  trust_remote_code: false
+  padding_side: right
+  attn_implementation: eager
+  gradient_checkpointing: true
+  gradient_checkpointing_use_reentrant: false
+
+lora:
+  target_modules:
+    - q_proj
+    - v_proj
+    - o_proj
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+
+optim:
+  lora_lr: 0.0001
+  lora_weight_decay: 0.0
+  max_lora_grad_norm: 1.0
+
+training:
+  steps: 500
+  batch_size: 16
+  micro_batch_size: 2
+  log_every: 1
+  save_every: 500
+
+wandb:
+  enabled: true
+  project: intent-update-mask-formal
+  name: claim1-stage1-sft-reasoning-matched-qwen05b-v100-step500
+  mode: online
+  allow_fallback_offline: true

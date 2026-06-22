@@ -1,0 +1,72 @@
+#!/bin/bash
+#PBS -N echo-stage2-math
+#PBS -q gpu_queue
+#PBS -l select=1:ncpus=32:ngpus=4:mpiprocs=4:ompthreads=8:mem=300gb
+#PBS -l walltime=24:00:00
+#PBS -r n
+#PBS -j oe
+#PBS -o /oceanstor/home/e1553870/ECHO/outputs/pbs/echo-stage2-math.out
+#PBS -e /oceanstor/home/e1553870/ECHO/outputs/pbs/echo-stage2-math.err
+
+set -euo pipefail
+
+ROOT="/oceanstor/home/e1553870/ECHO"
+CONFIG="${CONFIG:-${ROOT}/configs/stage2_masked_sft_math_qwen_v100.yaml}"
+OUTPUT_DIR="${OUTPUT_DIR:-}"
+CONDA_BASE="${CONDA_BASE:-/home/svu/e1553870/miniconda3}"
+CONDA_ENV="${CONDA_ENV:-s2i}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+
+mkdir -p "${ROOT}/outputs/pbs"
+LOG_STDOUT="${ROOT}/outputs/pbs/echo-stage2-math-${PBS_JOBID:-$$}.out"
+LOG_STDERR="${ROOT}/outputs/pbs/echo-stage2-math-${PBS_JOBID:-$$}.err"
+exec >"${LOG_STDOUT}" 2>"${LOG_STDERR}"
+
+cd "${ROOT}"
+
+if [ -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
+  . "${CONDA_BASE}/etc/profile.d/conda.sh"
+else
+  echo "[ERROR] conda.sh not found under ${CONDA_BASE}" >&2
+  exit 2
+fi
+conda activate "${CONDA_ENV}"
+
+export LD_LIBRARY_PATH="${CONDA_PREFIX:+${CONDA_PREFIX}/lib:}${LD_LIBRARY_PATH:-}"
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${ROOT}/src:${ROOT}/scripts:${PYTHONPATH:-}"
+export HF_HOME="${HF_HOME:-/oceanstor/home/e1553870/.cache/huggingface}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export WANDB_DIR="${WANDB_DIR:-${ROOT}/outputs/wandb}"
+export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-8}"
+
+mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}" "${WANDB_DIR}"
+
+echo "[INFO] host=$(hostname)"
+echo "[INFO] root=${ROOT}"
+echo "[INFO] config=${CONFIG}"
+echo "[INFO] output_dir=${OUTPUT_DIR:-<config default>}"
+echo "[INFO] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+python - <<'PY'
+import torch
+print("torch", torch.__version__, "cuda", torch.version.cuda, "available", torch.cuda.is_available())
+print("device_count", torch.cuda.device_count())
+if torch.cuda.device_count() < 4:
+    raise SystemExit("Expected 4 visible CUDA devices")
+x = torch.ones((), device="cuda")
+print("cuda_smoke", float((x + 1).item()), "capability", torch.cuda.get_device_capability(0), "name", torch.cuda.get_device_name(0))
+PY
+nvidia-smi
+
+ARGS=(--config "${CONFIG}")
+if [ -n "${OUTPUT_DIR}" ]; then
+  ARGS+=(--output-dir "${OUTPUT_DIR}")
+fi
+
+torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC_PER_NODE}" \
+  scripts/run_stage2_masked_sft.py "${ARGS[@]}"

@@ -1,0 +1,79 @@
+#!/bin/bash
+#PBS -N echo-s2-mask-pdf
+#PBS -q gpu_queue
+#PBS -l select=1:ncpus=8:ngpus=1:mpiprocs=1:ompthreads=8:mem=120gb
+#PBS -l walltime=03:00:00
+#PBS -r n
+#PBS -j oe
+#PBS -o /oceanstor/home/e1553870/ECHO/outputs/pbs/echo-s2-mask-pdf.out
+#PBS -e /oceanstor/home/e1553870/ECHO/outputs/pbs/echo-s2-mask-pdf.err
+
+set -euo pipefail
+
+ROOT="/oceanstor/home/e1553870/ECHO"
+CONFIG="${CONFIG:-${ROOT}/configs/claim1_stage2_echo_math_qwen_v100.yaml}"
+RUN_DIR="${RUN_DIR:-${ROOT}/outputs/claim1_stage2_echo_math_from_stage1_echo_clean_qwen05b_v100}"
+OUTPUT="${OUTPUT:-${ROOT}/outputs/mask_distribution_claim1_clean/stage2_mask_cases.pdf}"
+SAMPLE_COUNT="${SAMPLE_COUNT:-20}"
+SAMPLE_SEED="${SAMPLE_SEED:-7319}"
+MODEL_PATH="${MODEL_PATH:-/oceanstor/home/e1553870/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987}"
+CONDA_BASE="${CONDA_BASE:-/home/svu/e1553870/miniconda3}"
+CONDA_ENV="${CONDA_ENV:-s2i}"
+
+mkdir -p "${ROOT}/outputs/pbs"
+LOG_STDOUT="${ROOT}/outputs/pbs/echo-s2-mask-pdf-${PBS_JOBID:-$$}.out"
+LOG_STDERR="${ROOT}/outputs/pbs/echo-s2-mask-pdf-${PBS_JOBID:-$$}.err"
+exec >"${LOG_STDOUT}" 2>"${LOG_STDERR}"
+
+cd "${ROOT}"
+
+if [ -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
+  . "${CONDA_BASE}/etc/profile.d/conda.sh"
+else
+  echo "[ERROR] conda.sh not found under ${CONDA_BASE}" >&2
+  exit 2
+fi
+conda activate "${CONDA_ENV}"
+
+export LD_LIBRARY_PATH="${CONDA_PREFIX:+${CONDA_PREFIX}/lib:}${LD_LIBRARY_PATH:-}"
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${ROOT}/src:${ROOT}/scripts:${PYTHONPATH:-}"
+export HF_HOME="${HF_HOME:-/oceanstor/home/e1553870/.cache/huggingface}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-8}"
+
+mkdir -p "$(dirname "${OUTPUT}")" "${HF_HOME}" "${HF_DATASETS_CACHE}"
+
+echo "[INFO] host=$(hostname)"
+echo "[INFO] config=${CONFIG}"
+echo "[INFO] run_dir=${RUN_DIR}"
+echo "[INFO] output=${OUTPUT}"
+echo "[INFO] sample_count=${SAMPLE_COUNT}"
+echo "[INFO] model_path=${MODEL_PATH}"
+echo "[INFO] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+python - <<'PY'
+import torch
+print("torch", torch.__version__, "cuda", torch.version.cuda, "available", torch.cuda.is_available())
+print("device_count", torch.cuda.device_count())
+if torch.cuda.is_available():
+    x = torch.ones((), device="cuda")
+    print("cuda_smoke", float((x + 1).item()), "name", torch.cuda.get_device_name(0))
+PY
+nvidia-smi || true
+
+python scripts/export_stage2_mask_pdf.py \
+  --config "${CONFIG}" \
+  --run-dir "${RUN_DIR}" \
+  --output "${OUTPUT}" \
+  --sample-count "${SAMPLE_COUNT}" \
+  --sample-seed "${SAMPLE_SEED}" \
+  --batch-size 2 \
+  --model-path "${MODEL_PATH}"

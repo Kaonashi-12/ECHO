@@ -123,12 +123,18 @@ def _load_examples(spec: dict[str, Any]) -> list[PromptCompletionExample]:
     dataset = load_dataset(path, name, split=split) if name else load_dataset(path, split=split)
     max_examples = spec.get("max_examples")
     kind = spec.get("kind", spec["name"])
+    completion_mode = spec.get("completion_mode", "final_answer")
     examples: list[PromptCompletionExample] = []
     for index, row in enumerate(dataset):
         if max_examples is not None and len(examples) >= int(max_examples):
             break
         try:
-            example = _format_example(kind, row, f"{spec['name']}:{index}")
+            example = _format_example(
+                kind,
+                row,
+                f"{spec['name']}:{index}",
+                completion_mode=completion_mode,
+            )
         except (KeyError, TypeError, ValueError):
             continue
         if example.prompt.strip() and example.completion.strip():
@@ -138,20 +144,35 @@ def _load_examples(spec: dict[str, Any]) -> list[PromptCompletionExample]:
     return examples
 
 
-def _format_example(kind: str, row: dict[str, Any], source_id: str) -> PromptCompletionExample:
+def _format_example(
+    kind: str,
+    row: dict[str, Any],
+    source_id: str,
+    completion_mode: str = "final_answer",
+) -> PromptCompletionExample:
     kind = kind.lower()
     if kind == "gsm8k":
-        return _qa(row["question"], _final_answer(row["answer"]), source_id)
+        return _qa(row["question"], _math_answer(row["answer"], completion_mode), source_id)
     if kind == "svamp":
         question = row.get("question_concat") or f"{row['Body']} {row['Question']}"
-        return _qa(question, str(row["Answer"]), source_id)
+        answer = _equation_answer(
+            equation=row.get("Equation"),
+            final_answer=row["Answer"],
+            completion_mode=completion_mode,
+        )
+        return _qa(question, answer, source_id)
     if kind == "asdiv":
         question = f"{row['body']} {row['question']}"
-        return _qa(question, str(row["answer"]), source_id)
+        answer = _equation_answer(
+            equation=row.get("formula"),
+            final_answer=row["answer"],
+            completion_mode=completion_mode,
+        )
+        return _qa(question, answer, source_id)
     if kind in {"mawps", "multiarith"}:
         question = row.get("question") or row.get("Question")
         answer = row.get("answer", row.get("Answer", row.get("final_ans")))
-        return _qa(str(question), _final_answer(answer), source_id)
+        return _qa(str(question), _math_answer(answer, completion_mode), source_id)
     if kind in {"arc", "ai2_arc", "arc_challenge", "arc_easy"}:
         return _multiple_choice(row["question"], row["choices"], row["answerKey"], source_id)
     if kind in {"openbookqa", "openbook"}:
@@ -169,6 +190,39 @@ def _qa(question: str, answer: str, source_id: str) -> PromptCompletionExample:
         completion=f" {answer}",
         source_id=source_id,
     )
+
+
+def _math_answer(answer: Any, completion_mode: str) -> str:
+    if completion_mode in {"final", "final_answer", "answer_only"}:
+        return _final_answer(answer)
+    if completion_mode in {"full", "full_solution", "solution"}:
+        return _normalize_solution(answer)
+    raise ValueError(f"Unsupported completion_mode={completion_mode!r}")
+
+
+def _equation_answer(
+    equation: Any,
+    final_answer: Any,
+    completion_mode: str,
+) -> str:
+    final = _final_answer(final_answer)
+    if completion_mode in {"final", "final_answer", "answer_only"}:
+        return final
+    if completion_mode not in {"full", "full_solution", "solution"}:
+        raise ValueError(f"Unsupported completion_mode={completion_mode!r}")
+    equation_text = _normalize_solution(equation)
+    if not equation_text:
+        return final
+    return f"{equation_text}\nFinal answer: {final}"
+
+
+def _normalize_solution(answer: Any) -> str:
+    lines = [
+        " ".join(line.strip().split())
+        for line in str(answer).strip().splitlines()
+        if line.strip()
+    ]
+    return "\n".join(lines)
 
 
 def _final_answer(answer: Any) -> str:

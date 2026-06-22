@@ -549,6 +549,48 @@ def masked_token_loss(
     return (token_loss * mask * valid_f).sum() / denom
 
 
+def apply_mask_transform(
+    mask: torch.Tensor,
+    valid: torch.Tensor,
+    mode: str = "none",
+    target_mean: float | None = None,
+) -> torch.Tensor:
+    mode = mode.lower()
+    if mode in {"none", "identity", ""}:
+        return mask
+    valid_f = valid.float()
+    if mode in {"rescale_mean", "fixed_mean", "mean_rescale"}:
+        if target_mean is None:
+            raise ValueError(f"mask_transform_mode={mode!r} requires mask_transform_target")
+        per_sample_mass = (mask * valid_f).sum(dim=1, keepdim=True).clamp_min(1e-6)
+        per_sample_count = valid_f.sum(dim=1, keepdim=True).clamp_min(1.0)
+        scale = (per_sample_count * float(target_mean)) / per_sample_mass.detach()
+        return (mask * scale).clamp(0.0, 1.0) * valid_f
+    if mode in {"fixed_mean_exact", "capped_mean", "exact_mean"}:
+        if target_mean is None:
+            raise ValueError(f"mask_transform_mode={mode!r} requires mask_transform_target")
+        target = float(target_mean)
+        if target <= 0.0:
+            return torch.zeros_like(mask)
+        if target >= 1.0:
+            return valid_f
+        per_sample_count = valid_f.sum(dim=1, keepdim=True).clamp_min(1.0)
+        target_mass = per_sample_count * target
+        detached_mask = (mask.detach() * valid_f).clamp_min(0.0)
+        lo = torch.zeros_like(target_mass)
+        hi = torch.ones_like(target_mass)
+        for _ in range(32):
+            mass = (detached_mask * hi).clamp(0.0, 1.0).sum(dim=1, keepdim=True)
+            hi = torch.where(mass < target_mass, hi * 2.0, hi)
+        for _ in range(32):
+            mid = (lo + hi) * 0.5
+            mass = (detached_mask * mid).clamp(0.0, 1.0).sum(dim=1, keepdim=True)
+            lo = torch.where(mass < target_mass, mid, lo)
+            hi = torch.where(mass < target_mass, hi, mid)
+        return (mask * hi.detach()).clamp(0.0, 1.0) * valid_f
+    raise ValueError(f"Unsupported mask_transform_mode={mode!r}")
+
+
 def apply_mask_budget_penalty(
     outer_loss: torch.Tensor,
     summary_tensors: dict[str, torch.Tensor],
@@ -1082,6 +1124,8 @@ def run_mask_to_lora_meta_step(
     mask_budget_mode: str,
     mask_loss_normalization: str,
     mask_loss_budget_floor: float | None,
+    mask_transform_mode: str = "none",
+    mask_transform_target: float | None = None,
     support_micro_batch_size: int | None = None,
     target_micro_batch_size: int | None = None,
     retain_micro_batch_size: int | None = None,
@@ -1104,6 +1148,12 @@ def run_mask_to_lora_meta_step(
         support_stats["hidden"],
         support_stats["scalars"].detach(),
         support_stats["valid"],
+    )
+    mask = apply_mask_transform(
+        mask,
+        support_stats["valid"],
+        mode=mask_transform_mode,
+        target_mean=mask_transform_target,
     )
 
     shadow_state, shadow_params = make_shadow_lora_state(model)
@@ -1140,7 +1190,7 @@ def run_mask_to_lora_meta_step(
                 shadow_params,
                 grad_outputs=gate_weights,
                 create_graph=True,
-                retain_graph=False,
+                retain_graph=True,
                 allow_unused=True,
             )
             if shadow_grads is None:
@@ -1276,6 +1326,8 @@ def main() -> None:
     retain_micro_batch_size = train_config.get("retain_micro_batch_size")
     mask_loss_normalization = train_config.get("mask_loss_normalization", "valid_count")
     mask_loss_budget_floor = train_config.get("mask_loss_budget_floor", mask_budget_target)
+    mask_transform_mode = train_config.get("mask_transform_mode", "none")
+    mask_transform_target = train_config.get("mask_transform_target")
     metrics_path = output_dir / "metrics.jsonl"
     trace_writer = MaskTraceWriter(output_dir, config.get("mask_trace", {}), rank)
     training_mode = train_config.get("mode", "online_lora")
@@ -1294,10 +1346,14 @@ def main() -> None:
         if training_mode == "state_bank_mask_only":
             load_lora_state(model, sampled_state["lora"], device=device)
 
+        retain_batch_size = int(train_config.get("retain_batch_size", 0))
+        if retain_kl_weight and retain_batch_size <= 0:
+            raise ValueError("retain_kl_weight > 0 requires retain_batch_size > 0")
+
         episode: TextEpisode = stream.sample_episode(
             support_size=train_config["support_batch_size"],
             target_size=train_config["target_batch_size"],
-            retain_size=train_config["retain_batch_size"],
+            retain_size=retain_batch_size,
         )
         support_batch = tokenize(
             tokenizer,
@@ -1313,13 +1369,18 @@ def main() -> None:
             max_length,
             device,
         )
-        retain_batch = tokenize(
-            tokenizer,
-            episode.retain_prompts,
-            episode.retain_completions,
-            max_length,
-            device,
-        )
+        if retain_batch_size > 0:
+            retain_batch = tokenize(
+                tokenizer,
+                episode.retain_prompts,
+                episode.retain_completions,
+                max_length,
+                device,
+            )
+        else:
+            retain_batch = {
+                "attention_mask": torch.zeros((), dtype=torch.long, device=device),
+            }
 
         mask_optimizer.zero_grad(set_to_none=True)
         lora_optimizer.zero_grad(set_to_none=True)
@@ -1349,6 +1410,8 @@ def main() -> None:
                 mask_budget_mode,
                 mask_loss_normalization,
                 mask_loss_budget_floor,
+                mask_transform_mode,
+                mask_transform_target,
                 support_micro_batch_size,
                 target_micro_batch_size,
                 retain_micro_batch_size,

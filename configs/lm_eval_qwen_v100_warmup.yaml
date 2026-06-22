@@ -1,0 +1,63 @@
+base_model:
+  name: Qwen/Qwen2.5-0.5B
+  trust_remote_code: false
+
+lora:
+  target_modules:
+    - q_proj
+    - v_proj
+    - o_proj
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+
+export:
+  output_root: outputs/hf_exports/qwen05b_v100
+  save_dtype: fp16
+  max_shard_size: 2GB
+
+models:
+  - name: base_qwen
+    type: base
+    pretrained: Qwen/Qwen2.5-0.5B
+  - name: stage1_echo_ckpt500
+    checkpoint: outputs/phase4_mask_real_math_qwen05b_v100_stage1_noreg_fp32_bs16x4/checkpoint_step_500.pt
+    hf_export_dir: outputs/hf_exports/qwen05b_v100/stage1_echo_ckpt500
+    strict_lora: true
+  - name: stage1_sft_final
+    checkpoint: outputs/stage1_sft_real_math_qwen05b_v100_fp32_bs16x4/checkpoint_final.pt
+    hf_export_dir: outputs/hf_exports/qwen05b_v100/stage1_sft_final
+    strict_lora: true
+  - name: stage2_raw_final
+    checkpoint: outputs/stage2_masked_sft_math_qwen05b_v100_from_stage1_noreg_step500_retry/checkpoint_final.pt
+    hf_export_dir: outputs/hf_exports/qwen05b_v100/stage2_raw_final
+    strict_lora: true
+  - name: stage2_top30_final
+    checkpoint: outputs/stage2_masked_sft_math_qwen05b_v100_from_stage1_noreg_step500_top30_retry/checkpoint_final.pt
+    hf_export_dir: outputs/hf_exports/qwen05b_v100/stage2_top30_final
+    strict_lora: true
+  - name: stage2_full_sft_final
+    checkpoint: outputs/stage2_full_sft_math_qwen05b_v100_from_stage1_noreg_step500/checkpoint_final.pt
+    hf_export_dir: outputs/hf_exports/qwen05b_v100/stage2_full_sft_final
+    strict_lora: true
+
+lm_eval:
+  model: hf
+  tasks:
+    - gsm8k
+    - hendrycks_math
+    - arc_challenge
+    - openbookqa
+    - commonsense_qa
+  # null means: do not override the task's official default few-shot setting.
+  num_fewshot: null
+  model_args:
+    dtype: float16
+    trust_remote_code: false
+  batch_size: auto
+  device: cuda:0
+  use_accelerate: true
+  num_processes: 4
+  log_samples: false
+  limit: 1
+  output_root: outputs/lm_eval_official/qwen05b_v100

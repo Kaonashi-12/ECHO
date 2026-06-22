@@ -1,0 +1,56 @@
+seed: 2026
+
+experiment:
+  output_dir: outputs/eval_generation_qwen05b_v100_smoke
+
+model:
+  name: Qwen/Qwen2.5-0.5B
+  max_length: 768
+  dtype: fp32
+  trust_remote_code: false
+  padding_side: left
+  attn_implementation: eager
+  gradient_checkpointing: false
+
+lora:
+  target_modules:
+    - q_proj
+    - v_proj
+    - o_proj
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+
+generation:
+  batch_size: 2
+  max_input_length: 768
+  max_new_tokens: 128
+  do_sample: false
+  temperature: 1.0
+  top_p: 1.0
+  padding_side: left
+  prediction_max_chars: 1024
+
+checkpoints:
+  - name: stage2_raw_ckpt500_final
+    path: outputs/stage2_masked_sft_math_qwen05b_v100_from_stage1_noreg_step500_retry/checkpoint_final.pt
+    strict_lora: true
+
+datasets:
+  - name: math_test_smoke
+    path: nlile/hendrycks-MATH-benchmark
+    config: default
+    split: test
+    kind: hendrycks_math
+    max_examples: 32
+    prompt_template: "Question: {problem}\nSolution:"
+    answer_field: solution
+    metadata_keys:
+      - subject
+      - level
+  - name: gsm8k_test_smoke
+    path: openai/gsm8k
+    config: main
+    split: test
+    kind: gsm8k
+    max_examples: 32

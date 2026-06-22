@@ -1,0 +1,108 @@
+#!/bin/bash
+#PBS -N echo-lmeval-warm
+#PBS -q gpu_queue
+#PBS -l select=1:ncpus=32:ngpus=4:mpiprocs=4:ompthreads=8:mem=300gb
+#PBS -l walltime=24:00:00
+#PBS -r n
+#PBS -j oe
+#PBS -o /oceanstor/home/e1553870/ECHO/outputs/pbs/echo-lmeval.out
+#PBS -e /oceanstor/home/e1553870/ECHO/outputs/pbs/echo-lmeval.err
+
+set -euo pipefail
+
+ROOT="/oceanstor/home/e1553870/ECHO"
+CONFIG="${CONFIG:-${ROOT}/configs/lm_eval_qwen_v100.yaml}"
+MODEL_NAME="${MODEL_NAME:-}"
+TASKS="${TASKS:-}"
+EXPORT_FIRST="${EXPORT_FIRST:-1}"
+OVERWRITE_EXPORT="${OVERWRITE_EXPORT:-0}"
+CONDA_BASE="${CONDA_BASE:-/home/svu/e1553870/miniconda3}"
+CONDA_ENV="${CONDA_ENV:-s2i}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+
+mkdir -p "${ROOT}/outputs/pbs"
+LOG_STDOUT="${ROOT}/outputs/pbs/echo-lmeval-${PBS_JOBID:-$$}.out"
+LOG_STDERR="${ROOT}/outputs/pbs/echo-lmeval-${PBS_JOBID:-$$}.err"
+exec >"${LOG_STDOUT}" 2>"${LOG_STDERR}"
+
+cd "${ROOT}"
+
+if [ -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
+  . "${CONDA_BASE}/etc/profile.d/conda.sh"
+else
+  echo "[ERROR] conda.sh not found under ${CONDA_BASE}" >&2
+  exit 2
+fi
+conda activate "${CONDA_ENV}"
+
+export LD_LIBRARY_PATH="${CONDA_PREFIX:+${CONDA_PREFIX}/lib:}${LD_LIBRARY_PATH:-}"
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${ROOT}/src:${ROOT}/scripts:${PYTHONPATH:-}"
+export HF_HOME="${HF_HOME:-/oceanstor/home/e1553870/.cache/huggingface}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-8}"
+
+mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}"
+
+echo "[INFO] host=$(hostname)"
+echo "[INFO] root=${ROOT}"
+echo "[INFO] config=${CONFIG}"
+echo "[INFO] model_name=${MODEL_NAME:-<all>}"
+echo "[INFO] tasks=${TASKS:-<config default>}"
+echo "[INFO] export_first=${EXPORT_FIRST}"
+echo "[INFO] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+python - <<'PY'
+import importlib.util
+import torch
+print("torch", torch.__version__, "cuda", torch.version.cuda, "available", torch.cuda.is_available())
+print("device_count", torch.cuda.device_count())
+if torch.cuda.device_count() < int(__import__("os").environ.get("NPROC_PER_NODE", "4")):
+    raise SystemExit("Expected requested visible CUDA devices")
+if importlib.util.find_spec("lm_eval") is None:
+    raise SystemExit('lm_eval is not installed; run: pip install "lm_eval[hf]"')
+PY
+nvidia-smi
+
+if [ "${EXPORT_FIRST}" = "1" ]; then
+  EXPORT_ARGS=(--config "${CONFIG}")
+  if [ -n "${MODEL_NAME}" ]; then
+    EXPORT_ARGS+=(--model-name "${MODEL_NAME}")
+  fi
+  if [ "${OVERWRITE_EXPORT}" = "1" ]; then
+    EXPORT_ARGS+=(--overwrite)
+  fi
+  python scripts/export_functional_lora_to_hf.py "${EXPORT_ARGS[@]}"
+fi
+
+EVAL_ARGS=(--config "${CONFIG}" --num-processes "${NPROC_PER_NODE}")
+if [ -n "${MODEL_NAME}" ]; then
+  EVAL_ARGS+=(--model-name "${MODEL_NAME}")
+fi
+if [ -n "${TASKS}" ]; then
+  EVAL_ARGS+=(--tasks "${TASKS}")
+fi
+
+
+# Warm the HF datasets/lm_eval processed cache in a single process first.
+# Multi-rank lm_eval can otherwise race while creating mapped Arrow cache files.
+WARM_CONFIG="${WARM_CONFIG:-${ROOT}/configs/lm_eval_qwen_v100_warmup.yaml}"
+WARM_ARGS=(--config "${WARM_CONFIG}" --num-processes 1 --no-accelerate)
+if [ -n "${MODEL_NAME}" ]; then
+  WARM_ARGS+=(--model-name "${MODEL_NAME}")
+else
+  # Use base_qwen only for warming; task processing/cache is model-independent.
+  WARM_ARGS+=(--model-name base_qwen)
+fi
+if [ -n "${TASKS}" ]; then
+  WARM_ARGS+=(--tasks "${TASKS}")
+fi
+export ECHO_LMEVAL_WARMUP=1
+python scripts/run_lm_eval_official.py "${WARM_ARGS[@]}"
+unset ECHO_LMEVAL_WARMUP
+
+python scripts/run_lm_eval_official.py "${EVAL_ARGS[@]}"

@@ -1,0 +1,138 @@
+seed: 2026
+
+experiment:
+  output_dir: outputs/fast_eval_proxy/qwen05b_v100_echo_sft_dual_stage_indmath_len512
+
+model:
+  name: Qwen/Qwen2.5-0.5B
+  max_length: 768
+  dtype: fp32
+  trust_remote_code: false
+  padding_side: left
+  attn_implementation: eager
+  gradient_checkpointing: false
+
+lora:
+  target_modules:
+    - q_proj
+    - v_proj
+    - o_proj
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+
+generation:
+  generation_batch_size: 8
+  choice_batch_size: 32
+  max_input_length: 768
+  max_new_tokens: 512
+  do_sample: false
+  temperature: 1.0
+  top_p: 1.0
+  padding_side: left
+  prediction_max_chars: 2048
+  choice_continuation: label_text
+  choice_score: norm
+
+checkpoints:
+  - name: base_qwen
+    type: base
+    path: null
+  - name: stage1_echo_2690_ckpt500
+    path: outputs/phase4_mask_real_math_qwen05b_v100_stage1_reasoning_noreg_fp32_len512_bs4x4_fixedmean035/checkpoint_step_500.pt
+    strict_lora: true
+  - name: stage2_echo_2690_ckpt500_adaptive_final
+    path: outputs/stage2_masked_sft_math_qwen05b_v100_from_2690_fixedmean_step500_adaptive/checkpoint_final.pt
+    strict_lora: true
+  - name: stage1_sft_final
+    path: outputs/stage1_sft_real_math_qwen05b_v100_fp32_bs16x4/checkpoint_final.pt
+    strict_lora: true
+  - name: stage2_full_sft_final
+    path: outputs/stage2_full_sft_math_qwen05b_v100_from_stage1_noreg_step500/checkpoint_final.pt
+    strict_lora: true
+
+datasets:
+  - name: aqua_rat_test_fast
+    path: deepmind/aqua_rat
+    config: raw
+    split: test
+    kind: aqua_rat
+    mode: choice_loglikelihood
+    sample_size: 254
+    sample_seed: 5101
+  - name: mmlu_abstract_algebra_test_fast
+    path: cais/mmlu
+    config: abstract_algebra
+    split: test
+    kind: mmlu_math
+    mode: choice_loglikelihood
+    sample_size: 100
+    sample_seed: 5201
+  - name: mmlu_college_mathematics_test_fast
+    path: cais/mmlu
+    config: college_mathematics
+    split: test
+    kind: mmlu_math
+    mode: choice_loglikelihood
+    sample_size: 100
+    sample_seed: 5202
+  - name: mmlu_elementary_mathematics_test_fast
+    path: cais/mmlu
+    config: elementary_mathematics
+    split: test
+    kind: mmlu_math
+    mode: choice_loglikelihood
+    sample_size: 128
+    sample_seed: 5203
+  - name: mmlu_high_school_mathematics_test_fast
+    path: cais/mmlu
+    config: high_school_mathematics
+    split: test
+    kind: mmlu_math
+    mode: choice_loglikelihood
+    sample_size: 128
+    sample_seed: 5204
+  - name: arc_challenge_validation_fast
+    path: allenai/ai2_arc
+    config: ARC-Challenge
+    split: validation
+    kind: arc_challenge
+    mode: choice_loglikelihood
+    sample_size: 128
+    sample_seed: 3101
+  - name: openbookqa_validation_fast
+    path: allenai/openbookqa
+    config: main
+    split: validation
+    kind: openbookqa
+    mode: choice_loglikelihood
+    sample_size: 128
+    sample_seed: 3102
+  - name: commonsenseqa_validation_fast
+    path: tau/commonsense_qa
+    split: validation
+    kind: commonsenseqa
+    mode: choice_loglikelihood
+    sample_size: 128
+    sample_seed: 3103
+  - name: gsm8k_test_aux_fast
+    path: openai/gsm8k
+    config: main
+    split: test
+    kind: gsm8k
+    mode: generation_short
+    sample_size: 64
+    sample_seed: 4101
+  - name: math_test_aux_fast
+    path: nlile/hendrycks-MATH-benchmark
+    config: default
+    split: test
+    kind: hendrycks_math
+    mode: generation_short
+    sample_size: 48
+    sample_seed: 4102
+    prompt_template: "Question: {problem}\nSolution:"
+    answer_field: solution
+    metadata_keys:
+      - subject
+      - level

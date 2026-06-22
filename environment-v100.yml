@@ -1,0 +1,26 @@
+name: s2i
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - torch==2.6.0+cu124
+      - transformers==5.12.0
+      - datasets==5.0.0
+      - peft==0.19.1
+      - accelerate==1.14.0
+      - evaluate==0.4.6
+      - lm_eval[hf]==0.4.12
+      - numpy==2.4.6
+      - pandas==3.0.3
+      - scikit-learn==1.9.0
+      - scipy==1.17.1
+      - tqdm==4.68.2
+      - pyyaml==6.0.3
+      - pytest==9.0.3
+      - sentencepiece==0.2.1
+      - protobuf==7.35.1
+      - safetensors==0.8.0
+      - wandb==0.27.2
