@@ -1,0 +1,109 @@
+seed: 2026
+
+experiment:
+  output_dir: outputs/claim1_teacher_sanity_answer_focus_qwen05b_v102_toploss_init_only
+
+data:
+  mode: real_math_cross
+  domains:
+    - name: gsm8k
+      path: openai/gsm8k
+      config: main
+      split: train
+      kind: gsm8k
+      completion_mode: full_solution
+    - name: svamp
+      path: ChilleD/SVAMP
+      split: train
+      kind: svamp
+      completion_mode: full_solution
+    - name: asdiv
+      path: EleutherAI/asdiv
+      split: validation
+      kind: asdiv
+      completion_mode: full_solution
+    - name: mawps
+      path: garrethlee/MAWPS
+      split: train
+      kind: mawps
+      completion_mode: full_solution
+    - name: multiarith
+      path: ChilleD/MultiArith
+      split: train
+      kind: multiarith
+      completion_mode: full_solution
+  retain_domains: []
+
+target_loss:
+  mode: answer_focus
+  answer_window_tokens: 8
+  min_tokens_per_sample: 24
+  max_tokens_per_sample: 64
+  include_numeric_tokens: true
+  include_operator_tokens: true
+  background_weight: 0.0
+  focus_weight: 1.0
+
+support_loss:
+  mode: all
+
+model:
+  name: Qwen/Qwen2.5-0.5B
+  max_length: 512
+  dtype: bf16
+  trust_remote_code: false
+  padding_side: right
+  attn_implementation: eager
+  gradient_checkpointing: true
+  gradient_checkpointing_use_reentrant: false
+
+lora:
+  target_modules:
+    - q_proj
+    - v_proj
+    - o_proj
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+
+mask_head:
+  hidden_proj: 192
+  mlp_hidden: 384
+  temperature: 1.0
+
+inner:
+  lr: 0.01
+
+outer:
+  retain_kl_weight: 0.0
+  mask_cost_weight: 0.0
+  mask_budget_target: 0.35
+  mask_budget_weight: 0.0
+  mask_budget_mode: symmetric
+
+teacher:
+  init_mode: top_loss
+  init_mask_rate: 0.35
+  init_per_sample: true
+  init_scale: 6.0
+  steps: 0
+  lr: 0.0
+  temperature: 0.5
+  mask_transform_mode: fixed_mean_exact
+  mask_transform_target: 0.35
+  eval_final: true
+
+training:
+  steps: 60
+  support_batch_size: 8
+  target_batch_size: 64
+  retain_batch_size: 0
+  mask_loss_normalization: mask_sum
+  mask_loss_budget_floor: null
+  support_micro_batch_size: 1
+  target_micro_batch_size: 12
+  retain_micro_batch_size: 1
+  log_every: 1
+
+summary:
+  last_n: 60

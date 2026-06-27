@@ -25,6 +25,7 @@ from run_phase4_mask_mvp import (  # noqa: E402
     init_distributed,
     is_rank0,
     load_model_and_tokenizer,
+    mask_type_summary,
     mask_loss_denominator,
     make_random_mask,
     make_top_loss_mask,
@@ -389,6 +390,14 @@ def main() -> None:
                 mask_stats["token_loss"],
                 mask_stats["entropy"],
                 mask_stats["margin"],
+            )
+            summary_tensors.update(
+                mask_type_summary(
+                    mask,
+                    mask_stats["valid"],
+                    mask_stats.get("token_types"),
+                    mask_stats.get("loss_weights"),
+                )
             )
             hard_rate = (
                 ((mask >= mask_threshold).float() * mask_stats["valid"].float()).sum()

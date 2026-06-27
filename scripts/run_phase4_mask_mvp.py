@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import sys
 import time
 from typing import Any
@@ -37,6 +38,32 @@ from s2i.methods.capability_mask import (
 )
 from s2i.utils.config import load_yaml
 from s2i.utils.seed import set_seed
+
+
+TOKEN_TYPE_OTHER = 0
+TOKEN_TYPE_FORMAT = 1
+TOKEN_TYPE_PUNCT = 2
+TOKEN_TYPE_NUMBER = 3
+TOKEN_TYPE_OPERATOR = 4
+TOKEN_TYPE_WORD = 5
+TOKEN_TYPE_ANSWER = 6
+TOKEN_TYPE_NAMES = {
+    TOKEN_TYPE_OTHER: "other",
+    TOKEN_TYPE_FORMAT: "format",
+    TOKEN_TYPE_PUNCT: "punct",
+    TOKEN_TYPE_NUMBER: "number",
+    TOKEN_TYPE_OPERATOR: "operator",
+    TOKEN_TYPE_WORD: "word",
+    TOKEN_TYPE_ANSWER: "answer",
+}
+FORMAT_RE = re.compile(
+    r"\b("
+    r"question|answer|solution|final|therefore|thus|hence|boxed|problem|choices"
+    r")\b",
+    re.IGNORECASE,
+)
+NUMBER_RE = re.compile(r"\d")
+OPERATOR_RE = re.compile(r"[=+\-*/^<>≤≥≈]|\\frac|\\sqrt|\\times|\\cdot")
 
 
 def parse_args() -> argparse.Namespace:
@@ -247,13 +274,124 @@ def sample_state(
     raise ValueError(f"Unsupported state-bank sampling schedule: {schedule}")
 
 
+def _find_boxed_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    marker = "\\boxed{"
+    start = 0
+    while True:
+        idx = text.find(marker, start)
+        if idx < 0:
+            break
+        pos = idx + len(marker)
+        depth = 1
+        while pos < len(text) and depth > 0:
+            if text[pos] == "{":
+                depth += 1
+            elif text[pos] == "}":
+                depth -= 1
+            pos += 1
+        if pos > idx + len(marker):
+            spans.append((idx, pos))
+        start = max(pos, idx + len(marker))
+    return spans
+
+
+def _answer_char_span(completion: str) -> tuple[int, int] | None:
+    text = str(completion)
+    boxed_spans = _find_boxed_spans(text)
+    if boxed_spans:
+        return boxed_spans[-1]
+    if "####" in text:
+        start = text.rfind("####") + len("####")
+        while start < len(text) and text[start].isspace():
+            start += 1
+        return (start, len(text)) if start < len(text) else None
+    lowered = text.lower()
+    markers = (
+        "final answer is",
+        "the final answer is",
+        "the answer is",
+        "answer is",
+        "answer:",
+        "final answer:",
+    )
+    marker_pos: tuple[int, int] | None = None
+    for marker in markers:
+        idx = lowered.rfind(marker)
+        if idx >= 0 and (marker_pos is None or idx > marker_pos[0]):
+            marker_pos = (idx, idx + len(marker))
+    if marker_pos is not None:
+        start = marker_pos[1]
+        while start < len(text) and text[start] in " :=\t\n\r":
+            start += 1
+        return (start, len(text)) if start < len(text) else marker_pos
+    number_matches = list(re.finditer(r"[-+]?(?:\d[\d,]*)(?:\.\d+)?(?:/\d+(?:\.\d+)?)?", text))
+    if number_matches:
+        match = number_matches[-1]
+        return match.span()
+    stripped = text.rstrip()
+    if not stripped:
+        return None
+    start = max(0, len(stripped) - 80)
+    return (start, len(stripped))
+
+
+def _classify_token_text(token_text: str, is_answer_span: bool) -> int:
+    stripped = token_text.strip()
+    if is_answer_span:
+        return TOKEN_TYPE_ANSWER
+    if not stripped:
+        return TOKEN_TYPE_PUNCT
+    if FORMAT_RE.search(stripped):
+        return TOKEN_TYPE_FORMAT
+    if NUMBER_RE.search(stripped):
+        return TOKEN_TYPE_NUMBER
+    if OPERATOR_RE.search(stripped):
+        return TOKEN_TYPE_OPERATOR
+    if all(not ch.isalnum() for ch in stripped):
+        return TOKEN_TYPE_PUNCT
+    if any(ch.isalpha() for ch in stripped):
+        return TOKEN_TYPE_WORD
+    return TOKEN_TYPE_OTHER
+
+
+def _overlaps(left: tuple[int, int], right: tuple[int, int]) -> bool:
+    return max(left[0], right[0]) < min(left[1], right[1])
+
+
+def _expand_positions(
+    positions: set[int],
+    valid_positions: list[int],
+    window_tokens: int,
+) -> set[int]:
+    if not positions or window_tokens <= 0:
+        return set(positions)
+    valid_set = set(valid_positions)
+    expanded = set(positions)
+    for pos in list(positions):
+        for delta in range(-window_tokens, window_tokens + 1):
+            candidate = pos + delta
+            if candidate in valid_set:
+                expanded.add(candidate)
+    return expanded
+
+
+def _loss_weight_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    if not config:
+        return {"mode": "all"}
+    return dict(config)
+
+
 def tokenize(
     tokenizer,
     prompts: list[str],
     completions: list[str],
     max_length: int,
     device: torch.device,
+    loss_focus: dict[str, Any] | None = None,
 ) -> dict[str, torch.Tensor]:
+    focus_config = _loss_weight_config(loss_focus)
+    focus_mode = str(focus_config.get("mode", "all")).lower()
     texts = [
         prompt + completion
         for prompt, completion in zip(prompts, completions)
@@ -264,12 +402,16 @@ def tokenize(
         truncation=True,
         max_length=max_length,
         add_special_tokens=False,
+        return_offsets_mapping=True,
         return_tensors="pt",
     )
+    offsets = encoded.pop("offset_mapping")
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded["attention_mask"].to(device)
     labels = input_ids.clone()
     labels[attention_mask == 0] = -100
+    loss_weights = torch.zeros_like(input_ids, dtype=torch.float32)
+    token_type_ids = torch.full_like(input_ids, TOKEN_TYPE_OTHER, dtype=torch.long)
     prompt_lengths = []
     for prompt in prompts:
         prompt_ids = tokenizer(
@@ -282,10 +424,78 @@ def tokenize(
         prompt_lengths.append(prompt_length)
     for row_idx, prompt_length in enumerate(prompt_lengths):
         labels[row_idx, :prompt_length] = -100
+        valid_positions = labels[row_idx].ne(-100).nonzero(as_tuple=False).flatten().tolist()
+        if not valid_positions:
+            continue
+
+        prompt_char_len = len(prompts[row_idx])
+        answer_span_rel = _answer_char_span(completions[row_idx])
+        answer_span_abs = (
+            (prompt_char_len + answer_span_rel[0], prompt_char_len + answer_span_rel[1])
+            if answer_span_rel is not None
+            else None
+        )
+        answer_positions: set[int] = set()
+        numeric_positions: set[int] = set()
+        operator_positions: set[int] = set()
+        for pos in valid_positions:
+            start = int(offsets[row_idx, pos, 0].item())
+            end = int(offsets[row_idx, pos, 1].item())
+            if end <= start:
+                token_text = tokenizer.decode([int(input_ids[row_idx, pos].detach().cpu())])
+                start = prompt_char_len
+                end = prompt_char_len + len(token_text)
+            else:
+                token_text = texts[row_idx][start:end]
+            in_answer_span = answer_span_abs is not None and _overlaps((start, end), answer_span_abs)
+            token_type = _classify_token_text(token_text, in_answer_span)
+            token_type_ids[row_idx, pos] = token_type
+            if in_answer_span:
+                answer_positions.add(pos)
+            if token_type == TOKEN_TYPE_NUMBER:
+                numeric_positions.add(pos)
+            if token_type == TOKEN_TYPE_OPERATOR:
+                operator_positions.add(pos)
+
+        selected = set(valid_positions)
+        if focus_mode in {"answer_focus", "final_answer", "final_answer_window"}:
+            selected = set(answer_positions)
+            selected = _expand_positions(
+                selected,
+                valid_positions,
+                int(focus_config.get("answer_window_tokens", 0)),
+            )
+            if focus_config.get("include_numeric_tokens", False):
+                selected.update(numeric_positions)
+            if focus_config.get("include_operator_tokens", False):
+                selected.update(operator_positions)
+            min_tokens = int(focus_config.get("min_tokens_per_sample", 1))
+            if len(selected) < min_tokens:
+                selected.update(valid_positions[-min_tokens:])
+            max_tokens = focus_config.get("max_tokens_per_sample")
+            if max_tokens is not None and len(selected) > int(max_tokens):
+                anchor = max(answer_positions) if answer_positions else valid_positions[-1]
+                selected = set(
+                    sorted(selected, key=lambda pos: (abs(pos - anchor), pos))[: int(max_tokens)]
+                )
+        elif focus_mode in {"all", "completion", "full"}:
+            selected = set(valid_positions)
+        else:
+            raise ValueError(f"Unsupported loss_focus.mode={focus_mode!r}")
+
+        background_weight = float(focus_config.get("background_weight", 0.0))
+        if background_weight:
+            loss_weights[row_idx, valid_positions] = background_weight
+        if selected:
+            loss_weights[row_idx, sorted(selected)] = float(focus_config.get("focus_weight", 1.0))
+        if float(loss_weights[row_idx, valid_positions].sum().item()) <= 0.0:
+            loss_weights[row_idx, valid_positions[-1:]] = 1.0
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,
+        "loss_weights": loss_weights.to(device),
+        "token_type_ids": token_type_ids.to(device),
         "prompt_lengths": torch.tensor(prompt_lengths, dtype=torch.long, device=device),
     }
 
@@ -428,6 +638,13 @@ def slice_batch(batch: dict[str, torch.Tensor], start: int, end: int) -> dict[st
     return {key: value[start:end] for key, value in batch.items()}
 
 
+def shifted_loss_weights(batch: dict[str, torch.Tensor], valid: torch.Tensor) -> torch.Tensor:
+    if "loss_weights" not in batch:
+        return valid.float()
+    weights = batch["loss_weights"][:, 1:].to(device=valid.device, dtype=torch.float32)
+    return weights * valid.float()
+
+
 def sequence_loss(
     model,
     batch: dict[str, torch.Tensor],
@@ -441,10 +658,11 @@ def sequence_loss(
             batch["attention_mask"],
         )
         token_loss, valid = token_loss_from_hidden(model, hidden_states, batch["labels"])
-        return masked_mean(token_loss, valid)
+        weights = shifted_loss_weights(batch, valid)
+        return (token_loss * weights).sum() / weights.sum().clamp_min(1.0)
 
     total_loss = None
-    total_valid = torch.zeros((), device=batch["input_ids"].device, dtype=torch.float32)
+    total_weight = torch.zeros((), device=batch["input_ids"].device, dtype=torch.float32)
     for start in range(0, batch_size, micro_batch_size):
         sub_batch = slice_batch(batch, start, min(start + micro_batch_size, batch_size))
         hidden_states = model_hidden_states(
@@ -453,13 +671,13 @@ def sequence_loss(
             sub_batch["attention_mask"],
         )
         token_loss, valid = token_loss_from_hidden(model, hidden_states, sub_batch["labels"])
-        valid_f = valid.float()
-        loss_sum = (token_loss * valid_f).sum()
+        weights = shifted_loss_weights(sub_batch, valid)
+        loss_sum = (token_loss * weights).sum()
         total_loss = loss_sum if total_loss is None else total_loss + loss_sum
-        total_valid = total_valid + valid_f.sum()
+        total_weight = total_weight + weights.sum()
     if total_loss is None:
         return torch.zeros((), device=batch["input_ids"].device)
-    return total_loss / total_valid.clamp_min(1.0)
+    return total_loss / total_weight.clamp_min(1.0)
 
 
 def sequence_loss_with_stats(model, batch: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -469,7 +687,8 @@ def sequence_loss_with_stats(model, batch: dict[str, torch.Tensor]) -> torch.Ten
         batch["attention_mask"],
     )
     token_loss, _, _, valid = token_stats_from_hidden(model, hidden_states, batch["labels"])
-    return masked_mean(token_loss, valid)
+    weights = shifted_loss_weights(batch, valid)
+    return (token_loss * weights).sum() / weights.sum().clamp_min(1.0)
 
 
 def forward_for_mask(
@@ -513,6 +732,11 @@ def forward_for_mask(
         "valid": valid,
         "hidden": hidden,
         "scalars": scalars,
+        "loss_weights": shifted_loss_weights(batch, valid),
+        "token_types": batch.get(
+            "token_type_ids",
+            torch.full_like(batch["labels"], TOKEN_TYPE_OTHER),
+        )[:, 1:].to(device=valid.device, dtype=torch.long),
     }
 
 
@@ -617,6 +841,41 @@ def apply_mask_budget_penalty(
         raise ValueError(f"Unsupported mask_budget_mode={mode!r}")
     summary_tensors["mask_budget_loss"] = budget_loss
     return outer_loss + weight * budget_loss
+
+
+def mask_type_summary(
+    mask: torch.Tensor,
+    valid: torch.Tensor,
+    token_types: torch.Tensor | None = None,
+    loss_weights: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    if token_types is None:
+        return {}
+    valid_bool = valid.bool()
+    valid_f = valid.float()
+    mask_mass = (mask * valid_f).sum().clamp_min(1e-6)
+    metrics: dict[str, torch.Tensor] = {}
+    for type_id, name in TOKEN_TYPE_NAMES.items():
+        type_valid = valid_bool & token_types.eq(type_id)
+        type_f = type_valid.float()
+        count = type_f.sum()
+        if count.item() == 0:
+            zero = torch.zeros((), device=mask.device)
+            metrics[f"token_type_{name}_count"] = zero
+            metrics[f"mask_rate_{name}"] = zero
+            metrics[f"mask_mass_frac_{name}"] = zero
+            continue
+        type_mask_mass = (mask * type_f).sum()
+        metrics[f"token_type_{name}_count"] = count
+        metrics[f"mask_rate_{name}"] = type_mask_mass / count.clamp_min(1.0)
+        metrics[f"mask_mass_frac_{name}"] = type_mask_mass / mask_mass
+    if loss_weights is not None:
+        focus = (loss_weights > 0).float() * valid_f
+        focus_count = focus.sum()
+        metrics["loss_focus_tokens"] = focus_count
+        metrics["loss_focus_fraction"] = focus_count / valid_f.sum().clamp_min(1.0)
+        metrics["mask_rate_loss_focus"] = (mask * focus).sum() / focus_count.clamp_min(1.0)
+    return metrics
 
 
 def add_mask_budget_metric(
@@ -813,9 +1072,26 @@ def baseline_adapt_loss(
     return float(loss.detach().cpu())
 
 
-def make_top_loss_mask(token_loss: torch.Tensor, valid: torch.Tensor, mask_rate: float) -> torch.Tensor:
+def make_top_loss_mask(
+    token_loss: torch.Tensor,
+    valid: torch.Tensor,
+    mask_rate: float,
+    *,
+    per_sample: bool = False,
+) -> torch.Tensor:
     valid_bool = valid.bool()
     mask = torch.zeros_like(token_loss)
+    if per_sample:
+        for row_idx in range(token_loss.shape[0]):
+            row_valid = valid_bool[row_idx]
+            row_count = int(row_valid.sum().item())
+            if row_count == 0:
+                continue
+            k = max(1, min(row_count, int(round(mask_rate * row_count))))
+            row_loss = token_loss[row_idx, row_valid]
+            threshold = torch.topk(row_loss, k=k).values.min()
+            mask[row_idx, row_valid] = (row_loss >= threshold).float()
+        return mask
     valid_count = int(valid_bool.sum().item())
     if valid_count == 0:
         return mask
@@ -1110,6 +1386,499 @@ def run_mask_only_meta_step(
     )
 
 
+def build_fast_lora_state_from_mask(
+    model,
+    support_batch: dict[str, torch.Tensor],
+    support_stats: dict[str, torch.Tensor],
+    mask: torch.Tensor,
+    inner_lr: float,
+    mask_loss_normalization: str,
+    mask_loss_budget_floor: float | None,
+    support_micro_batch_size: int | None = None,
+    create_graph: bool = True,
+) -> tuple[dict, torch.Tensor, torch.Tensor]:
+    shadow_state, shadow_params = make_shadow_lora_state(model)
+    denom = mask_loss_denominator(
+        mask,
+        support_stats["valid"],
+        mask_loss_normalization,
+        mask_loss_budget_floor,
+    )
+    batch_size = int(support_batch["input_ids"].shape[0])
+    support_micro_batch_size = support_micro_batch_size or batch_size
+    shadow_grads: list[torch.Tensor | None] | None = None
+    inner_loss_sum = torch.zeros((), device=support_batch["input_ids"].device)
+    with use_fast_lora(shadow_state):
+        for start in range(0, batch_size, support_micro_batch_size):
+            end = min(start + support_micro_batch_size, batch_size)
+            sub_batch = slice_batch(support_batch, start, end)
+            shadow_hidden = model_hidden_states(
+                model,
+                sub_batch["input_ids"],
+                sub_batch["attention_mask"],
+            )
+            shadow_token_loss, shadow_valid = token_loss_from_hidden(
+                model,
+                shadow_hidden,
+                sub_batch["labels"],
+            )
+            sub_mask = mask[start:end]
+            sub_valid_f = shadow_valid.float()
+            gate_weights = sub_mask * sub_valid_f / denom
+            sub_grads = torch.autograd.grad(
+                shadow_token_loss,
+                shadow_params,
+                grad_outputs=gate_weights,
+                create_graph=create_graph,
+                retain_graph=create_graph,
+                allow_unused=True,
+            )
+            if shadow_grads is None:
+                shadow_grads = list(sub_grads)
+            else:
+                shadow_grads = [
+                    old if new is None else new if old is None else old + new
+                    for old, new in zip(shadow_grads, sub_grads)
+                ]
+            inner_loss_sum = inner_loss_sum + (
+                shadow_token_loss.detach() * sub_mask * sub_valid_f
+            ).sum()
+            del shadow_hidden, shadow_token_loss, shadow_valid, sub_grads
+    if shadow_grads is None:
+        shadow_grads = [None for _ in shadow_params]
+    fast_state, inner_grad_norm = make_fast_lora_state_from_shadow(
+        shadow_state,
+        shadow_grads,
+        lr=inner_lr,
+    )
+    inner_loss = inner_loss_sum / denom.detach().clamp_min(1.0)
+    return fast_state, inner_grad_norm, inner_loss
+
+
+def outer_loss_from_fast_state(
+    model,
+    support_stats: dict[str, torch.Tensor],
+    mask: torch.Tensor,
+    target_batch: dict[str, torch.Tensor],
+    retain_batch: dict[str, torch.Tensor],
+    fast_state: dict,
+    retain_kl_weight: float,
+    mask_cost_weight: float,
+    mask_budget_target: float | None,
+    mask_budget_weight: float,
+    mask_budget_mode: str,
+    target_micro_batch_size: int | None = None,
+    retain_micro_batch_size: int | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+    with torch.no_grad():
+        target_loss_before = sequence_loss(
+            model,
+            target_batch,
+            micro_batch_size=target_micro_batch_size,
+        )
+    with use_fast_lora(fast_state):
+        target_loss_after = sequence_loss(
+            model,
+            target_batch,
+            micro_batch_size=target_micro_batch_size,
+        )
+    kl_loss = (
+        retain_kl(
+            model,
+            retain_batch,
+            fast_state,
+            micro_batch_size=retain_micro_batch_size,
+        )
+        if retain_kl_weight
+        else torch.zeros((), device=target_loss_after.device)
+    )
+    summary_tensors = mask_summary(
+        mask,
+        support_stats["valid"],
+        support_stats["token_loss"],
+        support_stats["entropy"],
+        support_stats["margin"],
+    )
+    summary_tensors.update(
+        mask_type_summary(
+            mask,
+            support_stats["valid"],
+            support_stats.get("token_types"),
+            support_stats.get("loss_weights"),
+        )
+    )
+    outer_loss = (
+        target_loss_after
+        + retain_kl_weight * kl_loss
+        + mask_cost_weight * summary_tensors["mask_rate"]
+    )
+    outer_loss = apply_mask_budget_penalty(
+        outer_loss,
+        summary_tensors,
+        mask_budget_target,
+        mask_budget_weight,
+        mask_budget_mode,
+    )
+    return outer_loss, summary_tensors, target_loss_before, target_loss_after, kl_loss
+
+
+def teacher_mix_value(config: dict[str, Any], step: int, total_steps: int) -> float:
+    start = float(config.get("teacher_mix_start", 1.0))
+    end = float(config.get("teacher_mix_end", 0.0))
+    warmup = int(config.get("teacher_warmup_steps", 0))
+    anneal_steps = int(config.get("teacher_anneal_steps", max(total_steps - warmup, 1)))
+    if step <= warmup:
+        return start
+    progress = min(1.0, max(0.0, (step - warmup) / max(anneal_steps, 1)))
+    return start + progress * (end - start)
+
+
+def distillation_loss(
+    student_mask: torch.Tensor,
+    teacher_mask: torch.Tensor,
+    valid: torch.Tensor,
+    config: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    valid_f = valid.float()
+    valid_count = valid_f.sum().clamp_min(1.0)
+    mse = ((student_mask - teacher_mask.detach()).pow(2) * valid_f).sum() / valid_count
+    loss = float(config.get("mse_weight", 1.0)) * mse
+    metrics: dict[str, torch.Tensor] = {"student_teacher_mse": mse}
+    budget_target = config.get("student_budget_target")
+    budget_weight = float(config.get("student_budget_weight", 0.0))
+    if budget_target is not None and budget_weight:
+        student_rate = (student_mask * valid_f).sum() / valid_count
+        budget_loss = (student_rate - float(budget_target)).pow(2)
+        loss = loss + budget_weight * budget_loss
+        metrics["student_budget_loss"] = budget_loss
+    corr = torch.zeros((), device=student_mask.device)
+    mask = valid.bool()
+    if mask.sum() >= 2:
+        s = student_mask[mask].float()
+        t = teacher_mask.detach()[mask].float()
+        s = s - s.mean()
+        t = t - t.mean()
+        denom = s.norm() * t.norm()
+        if denom.item() > 0.0:
+            corr = (s * t).sum() / denom
+    metrics["student_teacher_corr"] = corr
+    metrics["student_mask_rate"] = (student_mask * valid_f).sum() / valid_count
+    metrics["teacher_mask_rate"] = (teacher_mask.detach() * valid_f).sum() / valid_count
+    return loss, metrics
+
+
+def make_teacher_mask(
+    model,
+    support_batch: dict[str, torch.Tensor],
+    target_batch: dict[str, torch.Tensor],
+    retain_batch: dict[str, torch.Tensor],
+    support_stats: dict[str, torch.Tensor],
+    inner_lr: float,
+    retain_kl_weight: float,
+    mask_cost_weight: float,
+    mask_budget_target: float | None,
+    mask_budget_weight: float,
+    mask_budget_mode: str,
+    mask_loss_normalization: str,
+    mask_loss_budget_floor: float | None,
+    teacher_config: dict[str, Any],
+    support_micro_batch_size: int | None = None,
+    target_micro_batch_size: int | None = None,
+    retain_micro_batch_size: int | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    dict[str, torch.Tensor],
+]:
+    valid = support_stats["valid"]
+    teacher_lr = float(teacher_config.get("lr", 5.0))
+    teacher_steps = int(teacher_config.get("steps", 1))
+    temperature = float(teacher_config.get("temperature", 1.0))
+    transform_mode = teacher_config.get("mask_transform_mode", "fixed_mean_exact")
+    transform_target = teacher_config.get("mask_transform_target", mask_budget_target)
+    init_mode = str(teacher_config.get("init_mode", "zeros")).lower()
+    if init_mode in {"zeros", "uniform", "flat"}:
+        logits = torch.zeros_like(support_stats["token_loss"], requires_grad=True)
+    elif init_mode in {"top_loss", "top_loss_mask", "loss_topk"}:
+        init_rate = float(
+            teacher_config.get(
+                "init_mask_rate",
+                transform_target if transform_target is not None else mask_budget_target or 0.35,
+            )
+        )
+        init_scale = float(teacher_config.get("init_scale", 4.0))
+        init_per_sample = bool(teacher_config.get("init_per_sample", True))
+        init_mask = make_top_loss_mask(
+            support_stats["token_loss"].detach(),
+            valid,
+            init_rate,
+            per_sample=init_per_sample,
+        )
+        logits = torch.where(
+            init_mask.bool(),
+            torch.full_like(support_stats["token_loss"], init_scale),
+            torch.full_like(support_stats["token_loss"], -init_scale),
+        )
+        logits = (logits * valid.float()).detach().requires_grad_(True)
+    else:
+        raise ValueError(f"Unsupported teacher.init_mode={init_mode!r}")
+    last_metrics: dict[str, torch.Tensor] = {}
+    with torch.no_grad():
+        target_loss_before = sequence_loss(
+            model,
+            target_batch,
+            micro_batch_size=target_micro_batch_size,
+        ).detach()
+    target_loss_after = target_loss_before
+    kl_loss = torch.zeros((), device=target_loss_before.device)
+    inner_loss = torch.zeros((), device=target_loss_before.device)
+    inner_grad_norm = torch.zeros((), device=target_loss_before.device)
+    teacher_grad_norm = torch.zeros((), device=target_loss_before.device)
+
+    for _ in range(max(teacher_steps, 0)):
+        raw_mask = torch.sigmoid(logits / temperature) * valid.float()
+        teacher_mask = apply_mask_transform(
+            raw_mask,
+            valid,
+            mode=transform_mode,
+            target_mean=transform_target,
+        )
+        fast_state, inner_grad_norm, inner_loss = build_fast_lora_state_from_mask(
+            model,
+            support_batch,
+            support_stats,
+            teacher_mask,
+            inner_lr,
+            mask_loss_normalization,
+            mask_loss_budget_floor,
+            support_micro_batch_size=support_micro_batch_size,
+            create_graph=True,
+        )
+        (
+            outer_loss,
+            last_metrics,
+            _,
+            target_loss_after,
+            kl_loss,
+        ) = outer_loss_from_fast_state(
+            model,
+            support_stats,
+            teacher_mask,
+            target_batch,
+            retain_batch,
+            fast_state,
+            retain_kl_weight,
+            mask_cost_weight,
+            mask_budget_target,
+            mask_budget_weight,
+            mask_budget_mode,
+            target_micro_batch_size,
+            retain_micro_batch_size,
+        )
+        grad = torch.autograd.grad(
+            outer_loss,
+            logits,
+            retain_graph=False,
+            create_graph=False,
+        )[0]
+        teacher_grad_norm = grad.detach().float().norm()
+        logits = (logits - teacher_lr * grad).detach().requires_grad_(True)
+
+    with torch.no_grad():
+        raw_mask = torch.sigmoid(logits / temperature) * valid.float()
+        teacher_mask = apply_mask_transform(
+            raw_mask,
+            valid,
+            mode=transform_mode,
+            target_mean=transform_target,
+        )
+        valid_bool = valid.bool()
+        if valid_bool.any():
+            last_metrics["logit_std"] = logits.detach()[valid_bool].float().std(unbiased=False)
+            last_metrics["raw_mask_std"] = raw_mask.detach()[valid_bool].float().std(unbiased=False)
+        else:
+            last_metrics["logit_std"] = torch.zeros((), device=target_loss_before.device)
+            last_metrics["raw_mask_std"] = torch.zeros((), device=target_loss_before.device)
+        last_metrics["logit_grad_norm"] = teacher_grad_norm
+        last_metrics["steps"] = torch.tensor(float(teacher_steps), device=target_loss_before.device)
+
+    if bool(teacher_config.get("eval_final", True)):
+        fast_state, inner_grad_norm, inner_loss = build_fast_lora_state_from_mask(
+            model,
+            support_batch,
+            support_stats,
+            teacher_mask,
+            inner_lr,
+            mask_loss_normalization,
+            mask_loss_budget_floor,
+            support_micro_batch_size=support_micro_batch_size,
+            create_graph=False,
+        )
+        (
+            _final_outer_loss,
+            last_metrics,
+            _,
+            target_loss_after,
+            kl_loss,
+        ) = outer_loss_from_fast_state(
+            model,
+            support_stats,
+            teacher_mask,
+            target_batch,
+            retain_batch,
+            fast_state,
+            retain_kl_weight,
+            mask_cost_weight,
+            mask_budget_target,
+            mask_budget_weight,
+            mask_budget_mode,
+            target_micro_batch_size,
+            retain_micro_batch_size,
+        )
+        with torch.no_grad():
+            valid_bool = valid.bool()
+            if valid_bool.any():
+                last_metrics["logit_std"] = logits.detach()[valid_bool].float().std(unbiased=False)
+                last_metrics["raw_mask_std"] = raw_mask.detach()[valid_bool].float().std(unbiased=False)
+            else:
+                last_metrics["logit_std"] = torch.zeros((), device=target_loss_before.device)
+                last_metrics["raw_mask_std"] = torch.zeros((), device=target_loss_before.device)
+            last_metrics["logit_grad_norm"] = teacher_grad_norm
+            last_metrics["steps"] = torch.tensor(float(teacher_steps), device=target_loss_before.device)
+            last_metrics["final_eval"] = torch.ones((), device=target_loss_before.device)
+    else:
+        last_metrics["final_eval"] = torch.zeros((), device=target_loss_before.device)
+    return (
+        teacher_mask.detach(),
+        inner_loss.detach(),
+        inner_grad_norm.detach(),
+        target_loss_before.detach(),
+        target_loss_after.detach(),
+        kl_loss.detach(),
+        {f"teacher_{key}": value.detach() for key, value in last_metrics.items()},
+    )
+
+
+def run_teacher_student_meta_step(
+    model,
+    mask_head: TokenMaskHead,
+    support_batch: dict[str, torch.Tensor],
+    target_batch: dict[str, torch.Tensor],
+    retain_batch: dict[str, torch.Tensor],
+    step: int,
+    total_steps: int,
+    inner_lr: float,
+    retain_kl_weight: float,
+    mask_cost_weight: float,
+    mask_budget_target: float | None,
+    mask_budget_weight: float,
+    mask_budget_mode: str,
+    mask_loss_normalization: str,
+    mask_loss_budget_floor: float | None,
+    teacher_config: dict[str, Any],
+    distill_config: dict[str, Any],
+    student_mask_transform_mode: str = "none",
+    student_mask_transform_target: float | None = None,
+    support_micro_batch_size: int | None = None,
+    target_micro_batch_size: int | None = None,
+    retain_micro_batch_size: int | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    dict[str, torch.Tensor],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    dict[str, torch.Tensor],
+]:
+    support_stats = forward_for_mask(model, support_batch, detach_token_loss=True)
+    (
+        teacher_mask,
+        inner_loss,
+        inner_grad_norm,
+        target_loss_before,
+        target_loss_after,
+        kl_loss,
+        teacher_metrics,
+    ) = make_teacher_mask(
+        model,
+        support_batch,
+        target_batch,
+        retain_batch,
+        support_stats,
+        inner_lr,
+        retain_kl_weight,
+        mask_cost_weight,
+        mask_budget_target,
+        mask_budget_weight,
+        mask_budget_mode,
+        mask_loss_normalization,
+        mask_loss_budget_floor,
+        teacher_config,
+        support_micro_batch_size,
+        target_micro_batch_size,
+        retain_micro_batch_size,
+    )
+    student_mask = mask_head(
+        support_stats["hidden"].detach(),
+        support_stats["scalars"].detach(),
+        support_stats["valid"],
+    )
+    student_mask = apply_mask_transform(
+        student_mask,
+        support_stats["valid"],
+        mode=student_mask_transform_mode,
+        target_mean=student_mask_transform_target,
+    )
+    distill, distill_metrics = distillation_loss(
+        student_mask,
+        teacher_mask,
+        support_stats["valid"],
+        distill_config,
+    )
+    mix = teacher_mix_value(distill_config, step, total_steps)
+    train_mask = (mix * teacher_mask + (1.0 - mix) * student_mask.detach()) * support_stats[
+        "valid"
+    ].float()
+    summary_tensors = mask_summary(
+        student_mask.detach(),
+        support_stats["valid"],
+        support_stats["token_loss"],
+        support_stats["entropy"],
+        support_stats["margin"],
+    )
+    summary_tensors.update(
+        mask_type_summary(
+            student_mask.detach(),
+            support_stats["valid"],
+            support_stats.get("token_types"),
+            support_stats.get("loss_weights"),
+        )
+    )
+    summary_tensors.update(teacher_metrics)
+    summary_tensors.update(distill_metrics)
+    summary_tensors["teacher_mix"] = torch.tensor(mix, device=student_mask.device)
+    return (
+        distill,
+        support_stats,
+        summary_tensors,
+        student_mask.detach(),
+        train_mask.detach(),
+        inner_loss,
+        inner_grad_norm,
+        target_loss_before,
+        target_loss_after,
+        kl_loss,
+    )
+
+
 def run_mask_to_lora_meta_step(
     model,
     mask_head: TokenMaskHead,
@@ -1156,103 +1925,37 @@ def run_mask_to_lora_meta_step(
         target_mean=mask_transform_target,
     )
 
-    shadow_state, shadow_params = make_shadow_lora_state(model)
-    valid_f = support_stats["valid"].float()
-    denom = mask_loss_denominator(
+    fast_state, inner_grad_norm, inner_loss = build_fast_lora_state_from_mask(
+        model,
+        support_batch,
+        support_stats,
         mask,
-        support_stats["valid"],
+        inner_lr,
         mask_loss_normalization,
         mask_loss_budget_floor,
+        support_micro_batch_size=support_micro_batch_size,
+        create_graph=True,
     )
-    batch_size = int(support_batch["input_ids"].shape[0])
-    support_micro_batch_size = support_micro_batch_size or batch_size
-    shadow_grads: list[torch.Tensor | None] | None = None
-    inner_loss_sum = torch.zeros((), device=support_batch["input_ids"].device)
-    with use_fast_lora(shadow_state):
-        for start in range(0, batch_size, support_micro_batch_size):
-            end = min(start + support_micro_batch_size, batch_size)
-            sub_batch = slice_batch(support_batch, start, end)
-            shadow_hidden = model_hidden_states(
-                model,
-                sub_batch["input_ids"],
-                sub_batch["attention_mask"],
-            )
-            shadow_token_loss, shadow_valid = token_loss_from_hidden(
-                model,
-                shadow_hidden,
-                sub_batch["labels"],
-            )
-            sub_mask = mask[start:end]
-            sub_valid_f = shadow_valid.float()
-            gate_weights = sub_mask * sub_valid_f / denom
-            sub_grads = torch.autograd.grad(
-                shadow_token_loss,
-                shadow_params,
-                grad_outputs=gate_weights,
-                create_graph=True,
-                retain_graph=True,
-                allow_unused=True,
-            )
-            if shadow_grads is None:
-                shadow_grads = list(sub_grads)
-            else:
-                shadow_grads = [
-                    old if new is None else new if old is None else old + new
-                    for old, new in zip(shadow_grads, sub_grads)
-                ]
-            inner_loss_sum = inner_loss_sum + (
-                shadow_token_loss.detach() * sub_mask * sub_valid_f
-            ).sum()
-            del shadow_hidden, shadow_token_loss, shadow_valid, sub_grads
-    if shadow_grads is None:
-        shadow_grads = [None for _ in shadow_params]
-    fast_state, inner_grad_norm = make_fast_lora_state_from_shadow(
-        shadow_state,
-        shadow_grads,
-        lr=inner_lr,
-    )
-    inner_loss = inner_loss_sum / denom
-
-    with torch.no_grad():
-        target_loss_before = sequence_loss(
-            model,
-            target_batch,
-            micro_batch_size=target_micro_batch_size,
-        )
-    with use_fast_lora(fast_state):
-        target_loss_after = sequence_loss(
-            model,
-            target_batch,
-            micro_batch_size=target_micro_batch_size,
-        )
-    kl_loss = (
-        retain_kl(
-            model,
-            retain_batch,
-            fast_state,
-            micro_batch_size=retain_micro_batch_size,
-        )
-        if retain_kl_weight
-        else torch.zeros((), device=target_loss_after.device)
-    )
-    summary_tensors = mask_summary(
-        mask,
-        support_stats["valid"],
-        support_stats["token_loss"],
-        support_stats["entropy"],
-        support_stats["margin"],
-    )
-    outer_loss = (
-        target_loss_after
-        + retain_kl_weight * kl_loss
-        + mask_cost_weight * summary_tensors["mask_rate"]
-    )
-    outer_loss = apply_mask_budget_penalty(
+    (
         outer_loss,
         summary_tensors,
+        target_loss_before,
+        target_loss_after,
+        kl_loss,
+    ) = outer_loss_from_fast_state(
+        model,
+        support_stats,
+        mask,
+        target_batch,
+        retain_batch,
+        fast_state,
+        retain_kl_weight,
+        mask_cost_weight,
         mask_budget_target,
         mask_budget_weight,
         mask_budget_mode,
+        target_micro_batch_size,
+        retain_micro_batch_size,
     )
     return (
         outer_loss,
@@ -1331,9 +2034,23 @@ def main() -> None:
     metrics_path = output_dir / "metrics.jsonl"
     trace_writer = MaskTraceWriter(output_dir, config.get("mask_trace", {}), rank)
     training_mode = train_config.get("mode", "online_lora")
-    if training_mode not in {"online_lora", "state_bank_mask_only", "online_mask_to_lora"}:
+    if training_mode not in {
+        "online_lora",
+        "state_bank_mask_only",
+        "online_mask_to_lora",
+        "teacher_student_mask_to_lora",
+    }:
         raise ValueError(f"Unsupported training.mode={training_mode!r}")
     lora_meta_grad_weight = float(config["outer"].get("lora_meta_grad_weight", 1.0))
+    target_loss_focus = config.get("target_loss", {"mode": "all"})
+    support_loss_focus = config.get("support_loss", {"mode": "all"})
+    teacher_config = config.get("teacher", {})
+    distill_config = config.get("distillation", {})
+    student_mask_transform_mode = train_config.get("student_mask_transform_mode", mask_transform_mode)
+    student_mask_transform_target = train_config.get(
+        "student_mask_transform_target",
+        mask_transform_target,
+    )
 
     for step in range(1, train_config["steps"] + 1):
         step_start = time.time()
@@ -1361,6 +2078,7 @@ def main() -> None:
             episode.support_completions,
             max_length,
             device,
+            loss_focus=support_loss_focus,
         )
         target_batch = tokenize(
             tokenizer,
@@ -1368,6 +2086,7 @@ def main() -> None:
             episode.target_completions,
             max_length,
             device,
+            loss_focus=target_loss_focus,
         )
         if retain_batch_size > 0:
             retain_batch = tokenize(
@@ -1423,6 +2142,14 @@ def main() -> None:
                 support_stats["entropy"],
                 support_stats["margin"],
             )
+            summary_tensors.update(
+                mask_type_summary(
+                    mask,
+                    support_stats["valid"],
+                    support_stats.get("token_types"),
+                    support_stats.get("loss_weights"),
+                )
+            )
             add_mask_budget_metric(summary_tensors, mask_budget_target, mask_budget_mode)
             outer_loss.backward()
             extra_metrics["outer_lora_grad_norm"] = float(
@@ -1468,6 +2195,73 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(lora_params, config["optim"].get("max_lora_grad_norm", 1.0))
             mask_optimizer.step()
             lora_optimizer.step()
+        elif training_mode == "teacher_student_mask_to_lora":
+            (
+                outer_loss,
+                support_stats,
+                summary_tensors,
+                mask,
+                train_mask,
+                inner_loss,
+                inner_grad_norm,
+                target_loss_before,
+                target_loss_after,
+                kl_loss,
+            ) = run_teacher_student_meta_step(
+                model,
+                mask_head,
+                support_batch,
+                target_batch,
+                retain_batch,
+                step,
+                int(train_config["steps"]),
+                inner_lr,
+                retain_kl_weight,
+                mask_cost_weight,
+                mask_budget_target,
+                mask_budget_weight,
+                mask_budget_mode,
+                mask_loss_normalization,
+                mask_loss_budget_floor,
+                teacher_config,
+                distill_config,
+                student_mask_transform_mode,
+                student_mask_transform_target,
+                support_micro_batch_size,
+                target_micro_batch_size,
+                retain_micro_batch_size,
+            )
+            add_mask_budget_metric(summary_tensors, mask_budget_target, mask_budget_mode)
+            outer_loss.backward()
+            extra_metrics["outer_mask_grad_norm"] = float(
+                parameter_grad_norm(mask_head.parameters()).detach().cpu()
+            )
+            all_reduce_grads(mask_head.parameters(), world_size)
+            torch.nn.utils.clip_grad_norm_(
+                mask_head.parameters(),
+                config["optim"].get("max_grad_norm", 1.0),
+            )
+            mask_optimizer.step()
+
+            lora_optimizer.zero_grad(set_to_none=True)
+            support_stats_for_model = forward_for_mask(model, support_batch)
+            model_loss = masked_token_loss(
+                support_stats_for_model["token_loss"],
+                train_mask,
+                support_stats_for_model["valid"],
+                normalization=mask_loss_normalization,
+                budget_floor_rate=mask_loss_budget_floor,
+            )
+            model_loss.backward()
+            extra_metrics["support_lora_grad_norm"] = float(
+                parameter_grad_norm(lora_params).detach().cpu()
+            )
+            all_reduce_grads(lora_params, world_size)
+            torch.nn.utils.clip_grad_norm_(
+                lora_params,
+                config["optim"].get("max_lora_grad_norm", 1.0),
+            )
+            lora_optimizer.step()
         else:
             (
                 outer_loss,
@@ -1499,6 +2293,14 @@ def main() -> None:
                 support_stats["token_loss"],
                 support_stats["entropy"],
                 support_stats["margin"],
+            )
+            summary_tensors.update(
+                mask_type_summary(
+                    mask,
+                    support_stats["valid"],
+                    support_stats.get("token_types"),
+                    support_stats.get("loss_weights"),
+                )
             )
             add_mask_budget_metric(summary_tensors, mask_budget_target, mask_budget_mode)
             outer_loss.backward()
@@ -1549,6 +2351,17 @@ def main() -> None:
                     + retain_batch["attention_mask"].sum()
                 ).detach().cpu()
                 / max(elapsed, 1e-6)
+            ),
+            "target_loss_focus_tokens": float(
+                target_batch["loss_weights"][:, 1:].sum().detach().cpu()
+            ),
+            "target_loss_focus_fraction": float(
+                (
+                    target_batch["loss_weights"][:, 1:].sum()
+                    / target_batch["labels"][:, 1:].ne(-100).float().sum().clamp_min(1.0)
+                )
+                .detach()
+                .cpu()
             ),
         }
         metrics.update(extra_metrics)

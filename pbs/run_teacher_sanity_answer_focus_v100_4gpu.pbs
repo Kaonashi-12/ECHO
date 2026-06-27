@@ -1,0 +1,68 @@
+#!/bin/bash
+#PBS -N echo-ts-sanity
+#PBS -q normal
+#PBS -P 13004226
+#PBS -l select=1:ncpus=32:ngpus=4:mem=320gb
+#PBS -l walltime=04:00:00
+#PBS -r n
+#PBS -j oe
+#PBS -o /scratch/users/nus/e1553870/ECHO/outputs/pbs
+
+set -euo pipefail
+
+ROOT="${ROOT:-/scratch/users/nus/e1553870/ECHO}"
+CONFIG="${CONFIG:-${ROOT}/configs/claim1_teacher_sanity_answer_focus_qwen_v101.yaml}"
+OUTPUT_DIR="${OUTPUT_DIR:-}"
+CONDA_BASE="${CONDA_BASE:-/home/users/nus/e1553870/miniconda}"
+CONDA_ENV="${CONDA_ENV:-s2i}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+
+mkdir -p "${ROOT}/outputs/pbs"
+LIVE_LOG="${ROOT}/outputs/pbs/echo-ts-sanity-${PBS_JOBID:-manual}.live.log"
+exec > >(stdbuf -oL -eL tee -a "${LIVE_LOG}") 2>&1
+
+cd "${ROOT}"
+
+if command -v module >/dev/null 2>&1; then
+  module load cuda/12.2.2 2>/dev/null || true
+fi
+. "${CONDA_BASE}/etc/profile.d/conda.sh"
+conda activate "${CONDA_ENV}"
+
+export LD_LIBRARY_PATH="${CONDA_PREFIX:+${CONDA_PREFIX}/lib:}${LD_LIBRARY_PATH:-}"
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${ROOT}/src:${ROOT}/scripts:${PYTHONPATH:-}"
+export HF_HOME="${HF_HOME:-${ROOT}/.cache/huggingface}"
+export HF_HUB_CACHE="${HF_HOME}/hub"
+export HUGGINGFACE_HUB_CACHE="${HF_HUB_CACHE}"
+export TRANSFORMERS_CACHE="${HF_HUB_CACHE}"
+export HF_DATASETS_CACHE="${HF_HOME}/datasets"
+export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-8}"
+
+if [[ -z "${HUGGINGFACE_HUB_TOKEN:-}" && -r "${HOME}/.cache/huggingface/token" ]]; then
+  export HUGGINGFACE_HUB_TOKEN="$(<"${HOME}/.cache/huggingface/token")"
+  export HF_TOKEN="${HUGGINGFACE_HUB_TOKEN}"
+fi
+
+mkdir -p "${HF_HOME}" "${HF_HUB_CACHE}" "${HF_DATASETS_CACHE}"
+
+echo "[INFO] start=$(date -Is)"
+echo "[INFO] host=$(hostname)"
+echo "[INFO] root=${ROOT}"
+echo "[INFO] config=${CONFIG}"
+echo "[INFO] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+nvidia-smi
+
+ARGS=(--config "${CONFIG}")
+if [ -n "${OUTPUT_DIR}" ]; then
+  ARGS+=(--output-dir "${OUTPUT_DIR}")
+fi
+
+torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC_PER_NODE}" \
+  scripts/run_teacher_sanity_check.py "${ARGS[@]}"
+
+echo "[INFO] done=$(date -Is)"

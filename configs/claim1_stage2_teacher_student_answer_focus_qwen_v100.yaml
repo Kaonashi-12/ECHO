@@ -1,0 +1,72 @@
+seed: 2026
+
+experiment:
+  output_dir: outputs/claim1_stage2_teacher_student_answer_focus_math_qwen05b_v101
+
+checkpoint:
+  path: outputs/claim1_stage1_teacher_student_answer_focus_qwen05b_v101/checkpoint_final.pt
+  load_lora: true
+  strict_lora: true
+  require_mask_head: true
+
+data:
+  mode: hf_prompt_completion
+  path: nlile/hendrycks-MATH-benchmark
+  config: default
+  split: train
+  max_examples: null
+  prompt_template: "Question: {problem}\nSolution:"
+  completion_template: " {solution}"
+  metadata_keys:
+    - subject
+    - level
+
+model:
+  name: Qwen/Qwen2.5-0.5B
+  max_length: 768
+  dtype: bf16
+  trust_remote_code: false
+  padding_side: right
+  attn_implementation: eager
+  gradient_checkpointing: true
+  gradient_checkpointing_use_reentrant: false
+
+lora:
+  target_modules:
+    - q_proj
+    - v_proj
+    - o_proj
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+
+mask_head:
+  hidden_proj: 192
+  mlp_hidden: 384
+  temperature: 1.0
+
+optim:
+  lora_lr: 0.00005
+  lora_weight_decay: 0.0
+  max_lora_grad_norm: 1.0
+
+training:
+  steps: 1500
+  batch_size: 8
+  micro_batch_size: 2
+  mask_strategy: learned
+  mask_mode: soft
+  mask_threshold: 0.5
+  mask_calibration:
+    mode: none
+  mask_loss_normalization: mask_sum
+  mask_loss_budget_floor: null
+  log_every: 1
+  save_every: 500
+
+wandb:
+  enabled: true
+  project: intent-update-mask-formal
+  name: claim1-stage2-teacher-student-answer-focus-math-qwen05b-v101
+  mode: online
+  allow_fallback_offline: true

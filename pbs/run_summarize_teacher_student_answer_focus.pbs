@@ -1,0 +1,34 @@
+#!/bin/bash
+#PBS -N echo-ts-af-sum
+#PBS -q normal
+#PBS -P 13004226
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -l walltime=00:20:00
+#PBS -r n
+#PBS -j oe
+#PBS -o /scratch/users/nus/e1553870/ECHO/outputs/pbs
+
+set -euo pipefail
+
+ROOT="${ROOT:-/scratch/users/nus/e1553870/ECHO}"
+CONDA_BASE="${CONDA_BASE:-/home/users/nus/e1553870/miniconda}"
+CONDA_ENV="${CONDA_ENV:-s2i}"
+STAGE1="${STAGE1:-${ROOT}/outputs/claim1_stage1_teacher_student_answer_focus_qwen05b_v101}"
+STAGE2="${STAGE2:-${ROOT}/outputs/claim1_stage2_teacher_student_answer_focus_math_qwen05b_v101}"
+EVAL="${EVAL:-${ROOT}/outputs/eval_generation_claim1_teacher_student_answer_focus/qwen05b_v101_math500_local_n128}"
+OUTPUT="${OUTPUT:-${ROOT}/outputs/claim1_teacher_student_answer_focus_route_summary_v101.json}"
+
+mkdir -p "${ROOT}/outputs/pbs"
+LIVE_LOG="${ROOT}/outputs/pbs/echo-ts-af-sum-${PBS_JOBID:-manual}.live.log"
+exec > >(stdbuf -oL -eL tee -a "${LIVE_LOG}") 2>&1
+
+cd "${ROOT}"
+. "${CONDA_BASE}/etc/profile.d/conda.sh"
+conda activate "${CONDA_ENV}"
+
+python scripts/summarize_route_metrics.py \
+  --stage1 "${STAGE1}" \
+  --stage2 "${STAGE2}" \
+  --eval "${EVAL}" \
+  --last-n 100 \
+  --output "${OUTPUT}"

@@ -154,3 +154,78 @@ ignored. A new cluster needs only:
 - W&B configuration if online logging is desired,
 - a cluster-specific Slurm wrapper adapted from
   `slurm/run_phase4_mask_formal.sbatch`.
+
+## Teacher Sanity Update: 2026-06-23
+
+The active research route has moved from broad answer-window validation toward
+final-answer-only validation for the teacher. Support loss still covers all
+completion tokens; only the target validation loss is narrowed to the final
+answer span. The intent is to reduce noise from reasoning-format tokens and
+measure whether a support mask produces the answer change we actually care
+about.
+
+The current final-answer-only target config is:
+
+```yaml
+target_loss:
+  mode: answer_focus
+  answer_window_tokens: 0
+  min_tokens_per_sample: 1
+  max_tokens_per_sample: 4
+  include_numeric_tokens: false
+  include_operator_tokens: false
+  background_weight: 0.0
+  focus_weight: 1.0
+
+support_loss:
+  mode: all
+```
+
+The formal 4-GPU sanity run used
+`configs/claim1_teacher_sanity_final_answer_only_qwen_v103.yaml` with
+`target_batch_size=256` per rank, so the effective target set was 1024 examples
+per step. It completed 40 steps at about 152 seconds per step and used about
+22.2GB peak allocated GPU memory per rank.
+
+Summary from
+`outputs/claim1_teacher_sanity_final_answer_only_qwen05b_v103/summary.json`:
+
+```text
+teacher_gain_mean            0.2923
+top_loss_gain_mean           0.1479
+random_gain_mean             0.0787
+full_gain_mean               0.0869
+teacher_minus_top_loss_mean  0.1444
+teacher_win_top_loss_mean    0.7188
+teacher_win_random_mean      0.8000
+```
+
+Compared with the v102 solver-sharp answer-window teacher, v103 has slightly
+lower absolute teacher gain but a stronger and more stable advantage over the
+top-loss baseline:
+
+```text
+v102 solver-sharp: teacher_gain=0.3357, teacher-top_loss=0.1064, win_top=0.4813
+v103 final-only:   teacher_gain=0.2923, teacher-top_loss=0.1444, win_top=0.7188
+```
+
+This makes final-answer-only validation the preferred teacher sanity setting for
+the next Stage-1 teacher-student run.
+
+The current limitation is that the learned teacher mask is not literally a
+final-answer mask. The final-answer-only objective evaluates the virtual update
+on final-answer target tokens, but the teacher still chooses among all support
+completion tokens. In the v103 run, average teacher mask mass was:
+
+```text
+answer    15.5%
+punct     37.6%
+number    24.2%
+operator   9.5%
+word       8.8%
+```
+
+So the result should be interpreted as "final-answer validation finds useful
+support-token updates", not as proof that the teacher directly selects final
+answer tokens. The next experiment should test whether a student can distill
+this more stable teacher before changing the teacher search space itself.

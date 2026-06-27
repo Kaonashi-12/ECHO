@@ -1,0 +1,148 @@
+seed: 2026
+
+experiment:
+  output_dir: outputs/claim1_stage1_teacher_student_solver_sharp_qwen05b_v102_short
+
+data:
+  mode: real_math_cross
+  domains:
+    - name: gsm8k
+      path: openai/gsm8k
+      config: main
+      split: train
+      kind: gsm8k
+      completion_mode: full_solution
+    - name: svamp
+      path: ChilleD/SVAMP
+      split: train
+      kind: svamp
+      completion_mode: full_solution
+    - name: asdiv
+      path: EleutherAI/asdiv
+      split: validation
+      kind: asdiv
+      completion_mode: full_solution
+    - name: mawps
+      path: garrethlee/MAWPS
+      split: train
+      kind: mawps
+      completion_mode: full_solution
+    - name: multiarith
+      path: ChilleD/MultiArith
+      split: train
+      kind: multiarith
+      completion_mode: full_solution
+  retain_domains: []
+
+target_loss:
+  mode: answer_focus
+  answer_window_tokens: 8
+  min_tokens_per_sample: 24
+  max_tokens_per_sample: 64
+  include_numeric_tokens: true
+  include_operator_tokens: true
+  background_weight: 0.0
+  focus_weight: 1.0
+
+support_loss:
+  mode: all
+
+model:
+  name: Qwen/Qwen2.5-0.5B
+  max_length: 512
+  dtype: bf16
+  trust_remote_code: false
+  padding_side: right
+  attn_implementation: eager
+  gradient_checkpointing: true
+  gradient_checkpointing_use_reentrant: false
+
+lora:
+  target_modules:
+    - q_proj
+    - v_proj
+    - o_proj
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+
+mask_head:
+  hidden_proj: 192
+  mlp_hidden: 384
+  temperature: 1.0
+
+inner:
+  lr: 0.01
+
+outer:
+  retain_kl_weight: 0.0
+  mask_cost_weight: 0.0
+  mask_budget_target: 0.35
+  mask_budget_weight: 0.0
+  mask_budget_mode: symmetric
+  lora_meta_grad_weight: 0.0
+
+teacher:
+  steps: 8
+  lr: 20.0
+  temperature: 0.3
+  mask_transform_mode: fixed_mean_exact
+  mask_transform_target: 0.35
+  eval_final: true
+
+distillation:
+  mse_weight: 1.0
+  student_budget_target: 0.35
+  student_budget_weight: 0.05
+  teacher_mix_start: 1.0
+  teacher_mix_end: 0.10
+  teacher_warmup_steps: 50
+  teacher_anneal_steps: 250
+
+optim:
+  mask_lr: 0.0001
+  lora_lr: 0.0001
+  mask_weight_decay: 0.01
+  lora_weight_decay: 0.0
+  max_grad_norm: 1.0
+  max_lora_grad_norm: 1.0
+
+training:
+  mode: teacher_student_mask_to_lora
+  steps: 300
+  support_batch_size: 8
+  target_batch_size: 64
+  retain_batch_size: 0
+  mask_loss_normalization: mask_sum
+  mask_loss_budget_floor: null
+  mask_transform_mode: none
+  mask_transform_target: null
+  student_mask_transform_mode: fixed_mean_exact
+  student_mask_transform_target: 0.35
+  support_micro_batch_size: 1
+  target_micro_batch_size: 12
+  retain_micro_batch_size: 1
+  log_every: 1
+  baseline_every: 20
+  save_every: 100
+
+mask_trace:
+  enabled: true
+  filename: mask_trace_rank{rank}.jsonl.gz
+  every_n_steps: 25
+  threshold: 0.5
+  top_k: 32
+  include_text: true
+  include_token_ids: true
+  include_token_loss: true
+  include_all_values: false
+  round_digits: 6
+  flush_every_n_steps: 25
+  compresslevel: 3
+
+wandb:
+  enabled: false
+  project: intent-update-mask-formal
+  name: claim1-stage1-teacher-student-solver-sharp-qwen05b-v102-short
+  mode: offline
+  allow_fallback_offline: true
